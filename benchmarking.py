@@ -1,21 +1,17 @@
-import math
-import json
-import glob
+import os
+import csv
 import time
 import torch
 import sklearn
+import argparse
 import numpy as np
 import pandas as pd
-from math import log
-import seaborn as sns
-from tqdm import tqdm
 from datasets import Dataset
-import matplotlib.pyplot as plt
 from typing import Any, Tuple, Union
-from transformers import get_scheduler, AdamW
 from sklearn.preprocessing import LabelEncoder
 from transformers import AutoModelForSequenceClassification, RobertaTokenizer, TrainingArguments, Trainer
 
+os.environ["TQDM_DISABLE"] = "1"
 
 def preprocess_function(examples, tokenizer):
     return tokenizer(
@@ -62,26 +58,12 @@ def compute_metrics(eval_pred):
     return calculate_metric_with_sklearn(predictions, labels)
 
 
-def load_and_prepare_data():
-    splits = {'train': 'train.jsonl', 'validation': 'dev.jsonl', 'test': 'test.jsonl'}
+def load_and_prepare_data(path):
+    splits = {'train': 'train.json', 'validation': 'validation.json', 'test': 'test.json'}
 
-    # df_train = pd.read_json("hf://datasets/AdaptLLM/ChemProt/" + splits["train"], lines=True).iloc[:, 0:2]
-    # df_validation = pd.read_json("hf://datasets/AdaptLLM/ChemProt/" + splits["validation"], lines=True).iloc[:, 0:2]
-    # df_test = pd.read_json("hf://datasets/AdaptLLM/ChemProt/" + splits["test"], lines=True).iloc[:, 0:2]
-
-
-    df_train_rct = pd.read_json("hf://datasets/AdaptLLM/RCT/" + splits["train"], lines=True)
-    df_train_chem = pd.read_json("hf://datasets/AdaptLLM/ChemProt/" + splits["train"], lines=True)
-
-    df_validation_rct = pd.read_json("hf://datasets/AdaptLLM/RCT/" + splits["validation"], lines=True)
-    df_validation_chem = pd.read_json("hf://datasets/AdaptLLM/ChemProt/" + splits["validation"], lines=True)
-
-    df_test_rct = pd.read_json("hf://datasets/AdaptLLM/RCT/" + splits["test"], lines=True)
-    df_test_chem = pd.read_json("hf://datasets/AdaptLLM/ChemProt/" + splits["test"], lines=True)
-
-    df_train = pd.concat([df_train_rct.iloc[:,0:2], df_train_chem.iloc[:,0:2]])
-    df_validation = pd.concat([df_validation_rct.iloc[:,0:2], df_validation_chem.iloc[:,0:2]])
-    df_test = pd.concat([df_test_rct.iloc[:,0:2], df_test_chem.iloc[:,0:2]])
+    df_train = pd.read_json(os.path.join(path, splits["train"]), orient="records")
+    df_validation = pd.read_json(os.path.join(path, splits["validation"]), orient="records")
+    df_test = pd.read_json(os.path.join(path, splits["test"]), orient="records")
 
     label_encoder = LabelEncoder()
     all_labels = pd.concat([df_train['label'], df_validation['label'], df_test['label']])
@@ -93,29 +75,16 @@ def load_and_prepare_data():
 
     return df_train, df_validation, df_test
 
+
 def run_training(tokenizer, model, df_train, df_validation, df_test, output_dir):
     train_dataset = Dataset.from_pandas(df_train).map(lambda x: preprocess_function(x, tokenizer), batched=True)
     val_dataset = Dataset.from_pandas(df_validation).map(lambda x: preprocess_function(x, tokenizer), batched=True)
     test_dataset = Dataset.from_pandas(df_test).map(lambda x: preprocess_function(x, tokenizer), batched=True)
 
-    # Compute total training steps
-    per_device_train_batch_size = 16
-    num_train_epochs = 5
-    train_batch_size = per_device_train_batch_size * max(1, torch.cuda.device_count())
-    total_training_steps = math.ceil(len(train_dataset) / train_batch_size) * num_train_epochs
-
-
-    optimizer = AdamW(model.parameters(), lr=2e-5, weight_decay=0.01)
-    lr_scheduler = get_scheduler(
-        name="cosine",  # or "linear"
-        optimizer=optimizer,
-        num_warmup_steps=int(0.1 * total_training_steps),
-        num_training_steps=total_training_steps,
-    )
 
     training_args = TrainingArguments(
         output_dir=output_dir,
-        evaluation_strategy="epoch",
+        eval_strategy="epoch",
         save_strategy="epoch",
         save_total_limit=1,
         load_best_model_at_end=True,
@@ -124,9 +93,9 @@ def run_training(tokenizer, model, df_train, df_validation, df_test, output_dir)
         learning_rate=2e-5,
         weight_decay=0.01,
         warmup_ratio=0.1,
-        per_device_train_batch_size=per_device_train_batch_size,
-        per_device_eval_batch_size=32,
-        num_train_epochs=num_train_epochs,
+        per_device_train_batch_size=16,
+        per_device_eval_batch_size=16,
+        num_train_epochs=1,
         logging_steps=200,
         report_to="none"
     )
@@ -138,7 +107,6 @@ def run_training(tokenizer, model, df_train, df_validation, df_test, output_dir)
         eval_dataset=val_dataset,
         compute_metrics=compute_metrics,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
-        optimizers=(optimizer, lr_scheduler),
         tokenizer=tokenizer,
     )
 
@@ -153,7 +121,7 @@ def run_training(tokenizer, model, df_train, df_validation, df_test, output_dir)
     return results, train_end_time - train_start_time, eval_end_time - eval_start_time
   
 
-def initialize_adapt_model(new_tokens, tokenizer_base, tokenizer_adapt, model_base, model_adapt):
+def adapt_model_and_tokenizer(new_tokens, tokenizer_base, tokenizer_adapt, model_base, model_adapt):
     tokenizer_adapt.add_tokens(new_tokens)
     added = []
     skipped = []
@@ -184,114 +152,62 @@ def initialize_adapt_model(new_tokens, tokenizer_base, tokenizer_adapt, model_ba
 
     return tokenizer_adapt, model_adapt
 
-def extract_eval_f1(state, metric):
-    return [(log["epoch"], log[metric]) for log in state["log_history"] if metric in log]
+    
 
-def plot_metric(metric, base_state, adapt_state):
+if __name__ == "__main__":
 
-    # Set a consistent color palette
-    sns.set_theme(style="whitegrid")
-    colors = sns.color_palette("Set2", 2)  # 2 distinct colors
+    parser = argparse.ArgumentParser(description='Apdaptive Tokenization Benchmarking')
+    parser.add_argument('--model_name', type=str, help='Model name.', default='FacebookAI/roberta-base')
+    parser.add_argument('--adapt', type=str, help='Path to the txt file containing new token. Default=None, means no adaptation', default=None)
+    parser.add_argument('--dataset_path', type=str, help='Path to dataset.', default='hf://datasets/AdaptLLM/ChemProt/')
+    parser.add_argument('--output_path', type=str, help='Folder for outputs', default='output')
+    parser.add_argument('--run_name', type=str, help='Path to dataset.', default='output')
+    args = parser.parse_args()
 
-    epochs_base, base_score = zip(*extract_eval_f1(base_state, metric))
-    epochs_adapt, adapt_score = zip(*extract_eval_f1(adapt_state, metric))
+    os.makedirs(args.output_path, exist_ok=True)
 
-    plt.figure(figsize=(8, 5))
-    plt.plot(epochs_base, base_score, label="Base", color=colors[0], marker='o')
-    plt.plot(epochs_adapt, adapt_score, label="Adapt", color=colors[1], marker='o')
-    plt.xlabel("epoch")
-    plt.ylabel(metric)
-    plt.title(metric+" vs. epoch")
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-    plt.savefig("plots/"+metric+"_vs_epoch.jpg", dpi=300)
-
-def visualize_results(results_base, results_adapt, train_time_base, train_time_adapt, eval_time_base, eval_time_adapt):
-    base_path = glob.glob('/content/small_with_out_adapt.json')
-    adapt_path = glob.glob('/content/small_with_adapt.json')
-
-    # Load both JSON files
-    with open(base_path[0]) as f:
-        base_state = json.load(f)
-
-    with open(adapt_path[0]) as f:
-        adapt_state = json.load(f)
-
-    # Set a consistent color palette
-    sns.set_theme(style="whitegrid")
-    colors = sns.color_palette("Set2", 2)  # 2 distinct colors
-
-    plot_metric("eval_loss", base_state, adapt_state)
-    plot_metric("eval_f1", base_state, adapt_state)
-    plot_metric("eval_accuracy", base_state, adapt_state)
-    plot_metric("eval_precision", base_state, adapt_state)
-    plot_metric("eval_recall", base_state, adapt_state)
-
-    plt.figure(figsize=(6, 4))
-    plt.bar(["Base", "Adapt"], [results_base['eval_f1'], results_adapt['eval_f1']], color=colors)
-    plt.ylabel("F1")
-    plt.title("Adapt F1 vs. Base F1")
-    plt.tight_layout()
-    plt.show()
-    plt.savefig("plots/adapt_f1_vs_base_f1.jpg", dpi=300)
-
-    plt.figure(figsize=(6, 4))
-    plt.bar(["Base", "Adapt"], [train_time_base, train_time_adapt], color=colors)
-    plt.ylabel("Training Time (s)")
-    plt.title("Training Time Comparison")
-    plt.tight_layout()
-    plt.show()
-    plt.savefig("plots/training_time_comparison.jpg", dpi=300)
-
-    plt.figure(figsize=(6, 4))
-    plt.bar(["Base", "Adapt"], [eval_time_base, eval_time_adapt], color=colors)
-    plt.ylabel("Evaluation Time (s)")
-    plt.title("Evaluation Time Comparison")
-    plt.tight_layout()
-    plt.show()
-    plt.savefig("plots/evaluation_time_comparison.jpg", dpi=300)
-
-
-
-def main():
     start_time = time.time()
-    df_train, df_validation, df_test = load_and_prepare_data()
+    df_train, df_validation, df_test = load_and_prepare_data(args.path)
     print('Train:', len(df_train), 'Validation:', len(df_validation), 'Test:', len(df_test))
 
     print("\nLoading Base models...")
-    # Base model training
-    # tokenizer_base = AutoTokenizer.from_pretrained("FacebookAI/roberta-base")
-    tokenizer_base = RobertaTokenizer.from_pretrained("FacebookAI/roberta-base")
-    model_base = AutoModelForSequenceClassification.from_pretrained("FacebookAI/roberta-base", num_labels=len(df_train['label'].unique()))
-    print("\tInitiating training for base model...")
-    results_base, train_time_base, eval_time_base = run_training(tokenizer_base, model_base, df_train, df_validation, df_test, "/scratch/rahlab/vedant/adapt/small_with_out_adapt")
-    print("Base Results:", results_base)
-    print("Training Time - Base:", train_time_base)
-    print("Evaluation Time - Base:", eval_time_base, "\n")
+    tokenizer_base = RobertaTokenizer.from_pretrained(args.model_name)
+    model_base = AutoModelForSequenceClassification.from_pretrained(args.model_name, num_labels=len(df_train['label'].unique()))
 
-    # Adapted model training
-    # tokenizer_adapt = AutoTokenizer.from_pretrained("FacebookAI/roberta-base")
-    print("\nLoading New models...")
-    tokenizer_adapt = RobertaTokenizer.from_pretrained("FacebookAI/roberta-base")
-    model_adapt = AutoModelForSequenceClassification.from_pretrained("FacebookAI/roberta-base", num_labels=len(df_train['label'].unique()))
 
-    print('\nDomain adaptive Tokenization')
-    new_tokens = pd.read_csv('new_tokens/new_tokens.txt', header=None)[0].tolist()
-    print('New tokens read:', len(new_tokens))
-    print("\nInitiating training for adaptive tokenization model...")
-    tokenizer_adapt, model_adapt = initialize_adapt_model(new_tokens, tokenizer_base, tokenizer_adapt, model_base, model_adapt)
+    model_save_path = os.path.join(args.output_path, args.run_name)
 
-    results_adapt, train_time_adapt, eval_time_adapt = run_training(tokenizer_adapt, model_adapt, df_train, df_validation, df_test, "/scratch/rahlab/vedant/adapt/small_with_adapt")
-    print("Adapt Results:", results_adapt)
-    print("Training Times - Adapt:", train_time_adapt)
-    print("Evaluation Time - Adapt:", eval_time_adapt, "\n")
+    if args.adapt is None:
+        print("\tInitiating training for base model...")
+        results, train_time, eval_time = run_training(tokenizer_base, model_base, df_train, df_validation, df_test, model_save_path)
+        print("Base Results:", results)
+        print("Training Time - Base:", train_time)
+        print("Evaluation Time - Base:", eval_time, "\n")
 
-    # Visualize results
-    print("\nVisualizing results...")
-    visualize_results(results_base, results_adapt, train_time_base, train_time_adapt, eval_time_base, eval_time_adapt)
-    print("Results visualized successfully!")
-    end_time = time.time()
-    print("Total Time Taken:", end_time - start_time, "seconds")
-if __name__ == "__main__":
-    main()
+    else:
+        print('\nDomain adaptive Tokenization')
+        new_tokens = pd.read_csv(args.adapt, header=None)[0].tolist()
+        print('New tokens read:', len(new_tokens))
+
+        print("\nLoading New models...")
+        tokenizer_adapt = RobertaTokenizer.from_pretrained(args.model_name)
+        model_adapt = AutoModelForSequenceClassification.from_pretrained(args.model_name, num_labels=len(df_train['label'].unique()))
+
+        tokenizer_adapt, model_adapt = adapt_model_and_tokenizer(new_tokens, tokenizer_base, tokenizer_adapt, model_base, model_adapt)
+        print("\nInitiating training for adaptive tokenization model...")
+        results, train_time, eval_time = run_training(tokenizer_adapt, model_adapt, df_train, df_validation, df_test,  model_save_path)
+        print("Adapt Results:", results)
+        print("Training Times - Adapt:", train_time)
+        print("Evaluation Time - Adapt:", eval_time, "\n")
+
+    # Append results to CSV
+    log_file = os.path.join(args.output_path, "log.csv")
+    file_exists = os.path.exists(log_file)
+    with open(log_file, mode="a") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(["Run Name", "Loss", "Accuracy", "F1", "MCC", "Precision", "Recall", "Training Time", "Inference Time"])
+        writer.writerow([args.run_name, results["eval_loss"], results["eval_accuracy"], results["eval_f1"],
+                         results["eval_matthews_correlation"], results["eval_precision"], results["eval_recall"],
+                         train_time, eval_time])
+

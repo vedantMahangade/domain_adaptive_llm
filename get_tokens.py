@@ -1,13 +1,16 @@
+import os
 import re
 import math
 import nltk
+import argparse
 import pandas as pd
 from tqdm import tqdm
-from collections import defaultdict
+from itertools import chain
 from nltk.corpus import stopwords
-from datasets import load_dataset
+from collections import defaultdict
+from transformers import RobertaTokenizer
 from sklearn.preprocessing import LabelEncoder
-from transformers import AutoModelForSequenceClassification, RobertaTokenizer
+from datasets import load_dataset, concatenate_datasets
 
 
 nltk.download('stopwords')
@@ -24,26 +27,12 @@ def preprocess_function(examples, tokenizer):
 
 
 
-def load_and_prepare_data():
-    splits = {'train': 'train.jsonl', 'validation': 'dev.jsonl', 'test': 'test.jsonl'}
+def load_and_prepare_data(path):
+    splits = {'train': 'train.json', 'validation': 'validation.json', 'test': 'test.json'}
 
-    # df_train = pd.read_json("hf://datasets/AdaptLLM/ChemProt/" + splits["train"], lines=True).iloc[:, 0:2]
-    # df_validation = pd.read_json("hf://datasets/AdaptLLM/ChemProt/" + splits["validation"], lines=True).iloc[:, 0:2]
-    # df_test = pd.read_json("hf://datasets/AdaptLLM/ChemProt/" + splits["test"], lines=True).iloc[:, 0:2]
-
-
-    df_train_rct = pd.read_json("hf://datasets/AdaptLLM/RCT/" + splits["train"], lines=True)
-    df_train_chem = pd.read_json("hf://datasets/AdaptLLM/ChemProt/" + splits["train"], lines=True)
-
-    df_validation_rct = pd.read_json("hf://datasets/AdaptLLM/RCT/" + splits["validation"], lines=True)
-    df_validation_chem = pd.read_json("hf://datasets/AdaptLLM/ChemProt/" + splits["validation"], lines=True)
-
-    df_test_rct = pd.read_json("hf://datasets/AdaptLLM/RCT/" + splits["test"], lines=True)
-    df_test_chem = pd.read_json("hf://datasets/AdaptLLM/ChemProt/" + splits["test"], lines=True)
-
-    df_train = pd.concat([df_train_rct.iloc[:,0:2], df_train_chem.iloc[:,0:2]])
-    df_validation = pd.concat([df_validation_rct.iloc[:,0:2], df_validation_chem.iloc[:,0:2]])
-    df_test = pd.concat([df_test_rct.iloc[:,0:2], df_test_chem.iloc[:,0:2]])
+    df_train = pd.read_json(os.path.join(path, splits["train"]), orient="records")
+    df_validation = pd.read_json(os.path.join(path, splits["validation"]), orient="records")
+    df_test = pd.read_json(os.path.join(path, splits["test"]), orient="records")
 
     label_encoder = LabelEncoder()
     all_labels = pd.concat([df_train['label'], df_validation['label'], df_test['label']])
@@ -206,28 +195,48 @@ def adaptive_tokenization(base_corpus, domain_corpus, tokenizer_base):
     return new_tokens
 
 
-
-
-
-
 def main():
-    df_train, df_validation, df_test = load_and_prepare_data()
+    parser = argparse.ArgumentParser(description='Apdaptive Tokenization Benchmarking')
+    parser.add_argument('--model_name', type=str, help='Model name.', default='FacebookAI/roberta-base')
+    parser.add_argument('--domain_path', type=str, help='Path to dataset.', default='hf://datasets/AdaptLLM/ChemProt/')
+    parser.add_argument('--output_path', type=str, help='Train split.', default='/scratch/rahlab/vedant/adapt/data/med')
+    args = parser.parse_args()
+
+
+    df_train, df_validation, df_test = load_and_prepare_data(args.domain_path)
     print('\nTrain:', len(df_train), 'Validation:', len(df_validation), 'Test:', len(df_test))
 
     print('\n')
-    tokenizer_base = RobertaTokenizer.from_pretrained("FacebookAI/roberta-base")
+    tokenizer_base = RobertaTokenizer.from_pretrained(args.model_name)
     # model_base = AutoModelForSequenceClassification.from_pretrained("FacebookAI/roberta-base", num_labels=len(df_train['label'].unique()))
 
     print('\ndomain adaptive tokenization')
-    domain_corpus = df_train['text'].tolist()[:50000]
-    # base_corpus = [x['text'] for x in load_dataset("wikimedia/wikipedia", "20231101.en", split="train", streaming=True)]
+    domain_corpus = df_train['text'].tolist()
+
     # Load the dataset with a streaming approach to avoid loading everything into memory
-    dataset = load_dataset("wikimedia/wikipedia", "20231101.en", split="train", streaming=True)
-    base_corpus = [x['text'] for _, x in zip(range(184209), dataset)]
-    new_tokens = adaptive_tokenization(base_corpus, domain_corpus, tokenizer_base)
+    # dataset = load_dataset("wikimedia/wikipedia", "20231101.en", split="train", streaming=True)
+    # base_corpus = [x['text'] for _, x in zip(range(184209), dataset)]
+
+    # Download and load full datasets (no streaming)
+    wikipedia = load_dataset("wikimedia/wikipedia", "20231101.en", split="train")
+    bookcorpus = load_dataset("bookcorpus/bookcorpus", split="train", trust_remote_code=True)
+
+    # Optional: Convert to PyTorch format for efficiency if using tensors later
+    # (Not necessary if you're just iterating text, but doesn't hurt)
+    wikipedia = wikipedia.with_format("torch")
+    bookcorpus = bookcorpus.with_format("torch")
+
+    # Combine the two datasets
+    combined_dataset = concatenate_datasets([wikipedia, bookcorpus])
+
+    # Extract the 'text' field using a generator
+    combined_stream = (x['text'] for x in combined_dataset)
+
+    # Pass to your tokenization function
+    new_tokens = adaptive_tokenization(combined_stream, domain_corpus, tokenizer_base)
 
     # Write each word on a new line
-    with open("new_tokens1.txt", "w") as file:
+    with open(os.path.join(args.output, "new_tokens.txt"), "w") as file:
         for token in new_tokens:
             file.write(token + "\n")
 
