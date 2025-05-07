@@ -17,15 +17,6 @@ nltk.download('stopwords')
 stop_words = set(stopwords.words('english'))
 
 
-def preprocess_function(examples, tokenizer):
-    return tokenizer(
-        examples["text"],
-        padding="max_length",
-        truncation=True,
-        max_length=512
-    )
-
-
 
 def load_and_prepare_data(path):
     splits = {'train': 'train.json', 'validation': 'validation.json', 'test': 'test.json'}
@@ -82,55 +73,68 @@ def load_and_prepare_data(path):
 #     return df_train, df_validation, df_test
 
 
+# Function to return clean words from a sentence
 def clean_word_tokens(text, vocab_base):
     # tokens = word_tokenize(text)
     # tokens = text.strip().split()  # whitespace-based
-    tokens = text.split()
+    tokens = text.split()  # whitespace-based split
     clean_tokens = [
         tok for tok in tokens
-        if re.match(r"^[A-Za-z0-9\-]+$", tok)
-        and len(tok) > 2
-        and tok.lower() not in stop_words
-        and tok.lstrip('Ġ').lower() not in vocab_base
+        if re.match(r"^[A-Za-z0-9\-]+$", tok) #only keep alphanumeric characters and hyphens 
+        and len(tok) > 2 # token should be more than 2 characters
+        and tok.lower() not in stop_words # should not include stop words
+        and tok.lstrip('Ġ').lower() not in vocab_base # should not be present in base token vocabulary
     ]
     return clean_tokens
 
-
+# Get word counts (unigram counts) for all clean words in corpus
 def get_unigram_counts(text_list, tokenizer):
     vocab_base = set([x.lstrip('Ġ').lower() for x in list(tokenizer.get_vocab().keys())])
     unigram_counts = defaultdict(int)
     for text in tqdm(text_list):
         for word in clean_word_tokens(text,vocab_base):
-            unigram_counts[word] += 1
+            unigram_counts[word] += 1 # for every occrance of word add 1
     return unigram_counts
 
+# set sub token counts for each word in corpus
 def get_sequence_counts(unigram_counts, tokenizer, max_len=10, min_count=20):
     seq_counts = defaultdict(int)
     for word, count in tqdm(unigram_counts.items()):
+
+        # set subtokens from tokenizer for the word
         token_ids = tokenizer.encode(word, add_special_tokens=False, add_prefix_space=True)
+
+        # for first max_len sub tokens add one to every occurance
         for i in range(1, min(len(token_ids), max_len) + 1):
             subseq = tuple(token_ids[:i])
             seq_counts[subseq] += count
 
-    # Optional filter: Keep only sequences seen at least min_count times
+    # Keep only sequences seen at least min_count times
     seq_counts = {s: c for s, c in seq_counts.items() if c >= min_count}
     return seq_counts
 
+# normalize the seqeunce counts for phrase score calculation
 def normalize_distribution(counts_dict, total_unigrams):
     return {k: v / total_unigrams for k, v in counts_dict.items()}
 
+# compute phrase association score: score = P(phrase) / P(prefix)
 def compute_phrase_scores(T):
     phrase_scores = {}
     for seq in T:
         if len(seq) <= 1:
             continue
         prefix = seq[:-1]
-        phrase_scores[seq] = T.get(seq, 0) / (T.get(prefix, 1e-8))
+        phrase_scores[seq] = T.get(seq, 0) / (T.get(prefix, 1e-8)) # Avoid division by 0
     return phrase_scores
 
+# compute pointwise KL divergence between two phrase distributions
 def compute_pointwise_KL(T_base, T_domain):
     score_dkl = {}
+
+    # get all seq from domain and base corpus
     all_keys = set(T_domain.keys()).union(set(T_base.keys()))
+
+    # for all seq in domain and base corpus calculate KL divergence 
     for seq in all_keys:
         p = T_domain.get(seq, 0)
         q = T_base.get(seq, 1e-8)  # smooth base
@@ -138,12 +142,14 @@ def compute_pointwise_KL(T_base, T_domain):
             score_dkl[seq] = p * math.log(p / q)
     return score_dkl
 
+# select new tokens based on KL divergence and frequency thresholds
 def select_augmentations(score_dkl, T_domain_raw, T_base_raw, max_len=10, fmin=20, top_n=10000):
     augmentations = []
-    sorted_seqs = sorted(score_dkl.items(), key=lambda x: -x[1])
+    sorted_seqs = sorted(score_dkl.items(), key=lambda x: -x[1]) # Sort by highest KL score
     for seq, score in sorted_seqs:
         if len(augmentations) >= top_n:
             break
+        # Select only sequences that are frequent in both domain and base corpora
         if len(seq) <= max_len and T_domain_raw.get(seq, 0) >= fmin and T_base_raw.get(seq, 0) >= fmin:
             augmentations.append(seq)
     
@@ -154,22 +160,30 @@ def adaptive_tokenization(base_corpus, domain_corpus, tokenizer_base):
     # Requirement, get unigram distribution
     print("\nGetting unigram counts...")
     U_base = get_unigram_counts(base_corpus, tokenizer_base)     # S in the paper
+    print("\tBase corpus words:", len(U_base))
     U_domain = get_unigram_counts(domain_corpus, tokenizer_base) # D in the paper
+    print("\tDomain corpus words:", len(U_base))
 
     # Step 1: Get sequence counts
     print("\nGetting sequence counts...")
     T_base = get_sequence_counts(U_base, tokenizer_base)
+    print("\tBase corpus sequences:", len(T_base))
     T_domain = get_sequence_counts(U_domain, tokenizer_base)
+    print("\tDomain corpus sequences:", len(T_domain))
 
     # Step 2: Normalize Distribution
     print("\nNormalizing distributions...")
     T_base_norm = normalize_distribution(T_base, sum(U_base.values()))
+    print("\tBase corpus unigram normalized")
     T_domain_norm = normalize_distribution(T_domain, sum(U_domain.values()))
+    print("\tDomain corpus unigram normalized")
 
     #Step 3: Compute Phrase scores
     print("\nComputing phrase scores...")
     P_base = compute_phrase_scores(T_base_norm)
+    print("\tPhrase scores for base corpus calulated")
     P_domain = compute_phrase_scores(T_domain_norm)
+    print("\tPhrase scores for base corpus calulated")
 
     # Step 4: Compute KL divergence
     print("\nComputing KL divergence...")
@@ -187,7 +201,11 @@ def adaptive_tokenization(base_corpus, domain_corpus, tokenizer_base):
     )
 
     # Convert back to token strings for tokenizer extension
-    new_tokens = [tokenizer_base.decode(seq)for seq in augmentations_T]
+    new_tokens = []
+    for seq in augmentations_T:
+        decoded_seq = tokenizer_base.decode(seq)
+        decoded_seq = decoded_seq.rstrip('-')
+        new_tokens.append(decoded_seq)
 
     print("\nNumber of new tokens:", len(new_tokens))
     print("New tokens:", new_tokens)
@@ -236,7 +254,7 @@ def main():
     new_tokens = adaptive_tokenization(combined_stream, domain_corpus, tokenizer_base)
 
     # Write each word on a new line
-    with open(os.path.join(args.output, "new_tokens.txt"), "w") as file:
+    with open(os.path.join(args.output_path, "new_tokens.txt"), "w") as file:
         for token in new_tokens:
             file.write(token + "\n")
 

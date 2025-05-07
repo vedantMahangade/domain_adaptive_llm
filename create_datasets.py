@@ -25,23 +25,33 @@ df_validation = pd.concat([df_validation_rct.iloc[:,0:2], df_validation_chem.ilo
 # df_validation = df_validation.rename(columns={'text': 'text', 'label': 'label'})
 df_test = pd.concat([df_test_rct.iloc[:,0:2], df_test_chem.iloc[:,0:2]])
 # df_test = df_test.rename(columns={'text': 'text', 'label': 'label'})
-
-
+print('Train:', len(df_train), 'Validation:', len(df_validation), 'Test:', len(df_test))
 
 path = '/scratch/rahlab/vedant/adapt/data/med'
 df_train.to_json(os.path.join(path, "train.json"), orient='records', index=False)
 df_validation.to_json(os.path.join(path, "validation.json"), orient='records', index=False)
 df_test.to_json(os.path.join(path, "test.json"), orient='records', index=False)
-
 print("Datasets saved successfully.")
 
 print("Loading Fin phrasebank datasets from Hugging Face Hub...")
-# creating dataset for finance domain
-df = load_dataset('takala/financial_phrasebank', 'sentences_66agree', split='train').to_pandas()
-df = df.rename(columns={'sentence': 'text', 'label': 'label'})
 
-df_train, df_validation = train_test_split(df, test_size=0.3, random_state=42)
-df_validation, df_test = train_test_split(df_validation, test_size=0.5, random_state=42)
+
+# creating dataset for finance domain
+splits = {'train': 'data/train-00000-of-00001.parquet', 'test': 'data/test-00000-of-00001.parquet', 'validation': 'data/valid-00000-of-00001.parquet'}
+df_train = pd.read_parquet("hf://datasets/sjyuxyz/financial-sentiment-analysis/" + splits["train"]).iloc[:,0:2]
+df_test = pd.read_parquet("hf://datasets/sjyuxyz/financial-sentiment-analysis/" + splits["test"]).iloc[:,0:2]
+df_validation = pd.read_parquet("hf://datasets/sjyuxyz/financial-sentiment-analysis/" + splits["validation"]).iloc[:,0:2]
+
+df_train = df_train.rename(columns={'text': 'text', 'label': 'label'})
+df_validation = df_validation.rename(columns={'text': 'text', 'label': 'label'})
+df_test = df_test.rename(columns={'text': 'text', 'label': 'label'})
+
+print('Train:', len(df_train), 'Validation:', len(df_validation), 'Test:', len(df_test))
+# df = load_dataset('takala/financial_phrasebank', 'sentences_66agree', split='train').to_pandas()
+# df = df.rename(columns={'sentence': 'text', 'label': 'label'})
+# df_train, df_validation = train_test_split(df, test_size=0.3, random_state=42)
+# df_validation, df_test = train_test_split(df_validation, test_size=0.5, random_state=42)
+
 path = '/scratch/rahlab/vedant/adapt/data/fin'
 df_train.to_json(os.path.join(path, "train.json"), orient='records', index=False)
 df_validation.to_json(os.path.join(path, "validation.json"), orient='records', index=False)
